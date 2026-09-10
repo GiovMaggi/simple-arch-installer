@@ -29,6 +29,10 @@ set -Eeuo pipefail
 # Kernel:
 #   linux-zen
 #
+# IMPORTANT:
+#   This script does NOT test the network connection.
+#   It assumes the Arch ISO already has working internet.
+#
 # ============================================================
 
 
@@ -73,13 +77,14 @@ error() {
     exit 1
 }
 
+
 info() {
     echo "==> $*"
 }
 
 
 # ------------------------------------------------------------
-# Get partition path
+# Convert disk + partition number into partition path
 # ------------------------------------------------------------
 
 part_path() {
@@ -98,7 +103,7 @@ part_path() {
 
 
 # ------------------------------------------------------------
-# Wait for partition device
+# Wait until a partition device exists
 # ------------------------------------------------------------
 
 wait_for_partition() {
@@ -131,14 +136,14 @@ reload_partition_table() {
     info "Reloading partition table..."
 
     partprobe "$disk" 2>/dev/null || true
-    udevadm settle
+    udevadm settle 2>/dev/null || true
 
     sleep 1
 }
 
 
 # ------------------------------------------------------------
-# Find next unused partition number
+# Find next available partition number
 # ------------------------------------------------------------
 
 next_free_partition_number() {
@@ -164,7 +169,7 @@ next_free_partition_number() {
 
 
 # ------------------------------------------------------------
-# Check mounted partitions
+# Check whether disk has mounted partitions
 # ------------------------------------------------------------
 
 check_disk_not_mounted() {
@@ -209,7 +214,7 @@ if [[ ! -d /sys/firmware/efi ]]; then
 
     error "The Arch ISO was not booted in UEFI mode.
 
-Reboot and select the UEFI version of the Arch USB."
+Reboot and select the UEFI version of the Arch ISO."
 
 fi
 
@@ -239,7 +244,6 @@ REQUIRED_COMMANDS=(
     mount
     umount
     findmnt
-    awk
     grep
     sed
     partprobe
@@ -267,27 +271,21 @@ echo " Available disks"
 echo "============================================================"
 echo
 
-# TYPE is the third column.
-#
-# This correctly detects disks even if MODEL is empty.
-#
-# Examples:
-#
-#   /dev/sda
-#   /dev/nvme0n1
-#   /dev/vda
-#   /dev/mmcblk0
 
-mapfile -t DISKS < <(
-    lsblk -dpno NAME,SIZE,TYPE,MODEL |
-    awk '
-        $3 == "disk" {
-            if ($4 != "")
-                printf "%s|%s|%s\n", $1, $2, $4
-            else
-                printf "%s|%s|%s\n", $1, $2, "Unknown"
-        }
-    '
+# ------------------------------------------------------------
+# IMPORTANT:
+#
+# Do NOT parse MODEL in the same awk expression as TYPE.
+#
+# MODEL can be completely empty.
+#
+# Instead, detect disks using NAME/SIZE/TYPE only.
+# Then query MODEL separately.
+# ------------------------------------------------------------
+
+mapfile -t DISK_NAMES < <(
+    lsblk -dnro NAME,TYPE |
+    awk '$2 == "disk" { print "/dev/" $1 }'
 )
 
 
@@ -295,19 +293,49 @@ mapfile -t DISKS < <(
 # VERIFY DISKS
 # ============================================================
 
-if [[ ${#DISKS[@]} -eq 0 ]]; then
+if [[ ${#DISK_NAMES[@]} -eq 0 ]]; then
 
     echo
-    echo "The Arch ISO reported:"
+    echo "lsblk output:"
     echo
 
     lsblk -o NAME,SIZE,TYPE,MODEL
 
     echo
 
-    error "No physical disks were detected."
+    error "No physical disks were detected by the Arch ISO.
+
+The lsblk output above should show the available disks."
 
 fi
+
+
+# ============================================================
+# BUILD DISK INFORMATION
+# ============================================================
+
+declare -a DISKS=()
+
+for DISK in "${DISK_NAMES[@]}"; do
+
+    SIZE="$(
+        lsblk -dnro SIZE "$DISK" |
+        head -n1
+    )"
+
+    MODEL="$(
+        lsblk -dnro MODEL "$DISK" |
+        sed 's/[[:space:]]*$//' |
+        head -n1
+    )"
+
+    if [[ -z "$MODEL" ]]; then
+        MODEL="Unknown"
+    fi
+
+    DISKS+=("${DISK}|${SIZE}|${MODEL}")
+
+done
 
 
 # ============================================================
@@ -326,6 +354,7 @@ for i in "${!DISKS[@]}"; do
 
 done
 
+
 echo
 
 read -r -p "Choose disk number: " DISK_NUMBER
@@ -338,6 +367,7 @@ read -r -p "Choose disk number: " DISK_NUMBER
 if ! [[ "$DISK_NUMBER" =~ ^[0-9]+$ ]]; then
     error "Invalid disk number."
 fi
+
 
 if (( DISK_NUMBER < 1 ||
       DISK_NUMBER > ${#DISKS[@]} )); then
@@ -362,7 +392,7 @@ echo
 
 
 # ============================================================
-# PROTECT RUNNING ARCH ISO
+# PROTECT RUNNING ISO
 # ============================================================
 
 ROOT_SOURCE="$(findmnt -no SOURCE / 2>/dev/null || true)"
@@ -464,9 +494,11 @@ else
 
 fi
 
+
 echo
 
 read -r -p "Type YES to continue: " CONFIRM
+
 
 if [[ "$CONFIRM" != "YES" ]]; then
 
@@ -500,6 +532,7 @@ if [[ "$MODE" == "erase" ]]; then
 
     info "Creating new GPT partition table on $DISK..."
 
+
     sfdisk --wipe always "$DISK" <<'EOF'
 label: gpt
 
@@ -507,6 +540,7 @@ size=1G, type=U, name="EFI"
 size=4G, type=S, name="swap"
 size=, type=L, name="root"
 EOF
+
 
     reload_partition_table "$DISK"
 
@@ -535,7 +569,13 @@ else
 
     info "Searching for unallocated space..."
 
+
+    # --------------------------------------------------------
+    # Sector size
+    # --------------------------------------------------------
+
     SECTOR_SIZE="$(blockdev --getss "$DISK")"
+
 
     if ! [[ "$SECTOR_SIZE" =~ ^[0-9]+$ ]] ||
        (( SECTOR_SIZE == 0 )); then
@@ -546,7 +586,7 @@ else
 
 
     # --------------------------------------------------------
-    # Find largest contiguous free region
+    # Find largest free region
     # --------------------------------------------------------
 
     BEST_START=""
@@ -559,11 +599,14 @@ else
         [[ "$START" =~ ^[0-9]+$ ]] || continue
         [[ "$END" =~ ^[0-9]+$ ]] || continue
 
+
         if (( END < START )); then
             continue
         fi
 
+
         SECTORS=$((END - START + 1))
+
 
         if (( SECTORS > BEST_SECTORS )); then
 
@@ -585,7 +628,7 @@ else
 
 
     # --------------------------------------------------------
-    # Make sure free space exists
+    # Verify free space
     # --------------------------------------------------------
 
     if [[ -z "$BEST_START" ||
@@ -612,18 +655,23 @@ ALL mode will not modify existing partitions."
 
     ALIGNMENT=$((1024 * 1024 / SECTOR_SIZE))
 
+
     if (( ALIGNMENT < 1 )); then
         ALIGNMENT=1
     fi
 
 
     ALIGNED_START=$(
-        ((BEST_START + ALIGNMENT - 1) / ALIGNMENT) * ALIGNMENT
+        (
+            (BEST_START + ALIGNMENT - 1) / ALIGNMENT
+        ) * ALIGNMENT
     )
 
 
     ALIGNED_END=$(
-        ((BEST_END + 1) / ALIGNMENT) * ALIGNMENT - 1
+        (
+            (BEST_END + 1) / ALIGNMENT
+        ) * ALIGNMENT - 1
     )
 
 
@@ -640,20 +688,23 @@ ALL mode will not modify existing partitions."
 
 
     # --------------------------------------------------------
-    # Partition sizes
+    # Required sizes
     # --------------------------------------------------------
 
     EFI_SECTORS=$(
         (1024 * 1024 * 1024) / SECTOR_SIZE
     )
 
+
     SWAP_SECTORS=$(
         (4 * 1024 * 1024 * 1024) / SECTOR_SIZE
     )
 
+
     ROOT_MIN_SECTORS=$(
         (2 * 1024 * 1024 * 1024) / SECTOR_SIZE
     )
+
 
     REQUIRED_SECTORS=$(
         EFI_SECTORS +
@@ -664,14 +715,15 @@ ALL mode will not modify existing partitions."
 
     if (( AVAILABLE_SECTORS < REQUIRED_SECTORS )); then
 
-        AVAILABLE_GIB=$(
+        AVAILABLE_GIB="$(
             awk \
                 -v s="$AVAILABLE_SECTORS" \
                 -v b="$SECTOR_SIZE" \
                 'BEGIN {
                     printf "%.2f", (s*b)/(1024^3)
                 }'
-        )
+        )"
+
 
         error "The largest free-space region is too small.
 
@@ -702,30 +754,20 @@ Required:
 
     EFI_START="$ALIGNED_START"
 
-    EFI_END=$(
-        EFI_START + EFI_SECTORS - 1
-    )
+    EFI_END=$((EFI_START + EFI_SECTORS - 1))
 
 
-    SWAP_START=$(
-        EFI_END + 1
-    )
+    SWAP_START=$((EFI_END + 1))
 
-    SWAP_END=$(
-        SWAP_START + SWAP_SECTORS - 1
-    )
+    SWAP_END=$((SWAP_START + SWAP_SECTORS - 1))
 
 
-    ROOT_START=$(
-        SWAP_END + 1
-    )
+    ROOT_START=$((SWAP_END + 1))
 
     ROOT_END="$ALIGNED_END"
 
 
-    ROOT_SECTORS=$(
-        ROOT_END - ROOT_START + 1
-    )
+    ROOT_SECTORS=$((ROOT_END - ROOT_START + 1))
 
 
     if (( ROOT_SECTORS < ROOT_MIN_SECTORS )); then
@@ -736,13 +778,17 @@ root partition is too small."
     fi
 
 
+    # --------------------------------------------------------
+    # Partition paths
+    # --------------------------------------------------------
+
     EFI_PART="$(part_path "$DISK" "$EFI_NUMBER")"
     SWAP_PART="$(part_path "$DISK" "$SWAP_NUMBER")"
     ROOT_PART="$(part_path "$DISK" "$ROOT_NUMBER")"
 
 
     # --------------------------------------------------------
-    # Show planned partitions
+    # Show planned layout
     # --------------------------------------------------------
 
     echo
@@ -752,17 +798,22 @@ root partition is too small."
     echo "  End sector   : $ALIGNED_END"
     echo
 
+
     echo "New partitions:"
     echo
+
+
     echo "  EFI"
     echo "    Device : $EFI_PART"
     echo "    Size   : 1 GiB"
     echo
 
+
     echo "  SWAP"
     echo "    Device : $SWAP_PART"
     echo "    Size   : 4 GiB"
     echo
+
 
     echo "  ROOT"
     echo "    Device : $ROOT_PART"
@@ -775,6 +826,7 @@ root partition is too small."
     # --------------------------------------------------------
 
     info "Creating partitions inside the unallocated region..."
+
 
     sfdisk --append --no-reread "$DISK" <<EOF
 ${EFI_NUMBER}: start=${EFI_START}, size=${EFI_SECTORS}, type=U, name="EFI"
@@ -899,7 +951,7 @@ pacstrap -K /mnt "${PACKAGES[@]}"
 
 
 # ============================================================
-# FSTAB
+# GENERATE FSTAB
 # ============================================================
 
 echo
@@ -910,6 +962,7 @@ echo
 
 
 genfstab -U /mnt > /mnt/etc/fstab
+
 
 info "fstab generated."
 
@@ -943,7 +996,7 @@ hwclock --systohc
 # ------------------------------------------------------------
 
 sed -i \
-    's/^#${LOCALE} UTF-8/${LOCALE} UTF-8/' \
+    "s/^#${LOCALE} UTF-8/${LOCALE} UTF-8/" \
     /etc/locale.gen
 
 locale-gen
@@ -1018,7 +1071,7 @@ fi
 
 
 # ------------------------------------------------------------
-# Install GRUB UEFI
+# Install GRUB
 # ------------------------------------------------------------
 
 grub-install \
@@ -1080,7 +1133,7 @@ echo "Disk : $DISK"
 echo "Mode : $MODE"
 echo
 
-echo "Remove the Arch USB when the computer reboots."
+echo "Remove the Arch USB/ISO when the computer reboots."
 echo
 
 read -r -p "Press ENTER to reboot..."
