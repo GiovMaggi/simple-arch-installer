@@ -43,7 +43,7 @@ info() {
 part_path() {
   case "$1" in
     /dev/nvme*|/dev/mmcblk*|/dev/loop*) printf '%sp%s\n' "$1" "$2" ;;
-    *)                                  printf '%s%s\n' "$1" "$2" ;;
+    *)                              printf '%s%s\n' "$1" "$2" ;;
   esac
 }
 
@@ -102,7 +102,7 @@ build_other_os_entries() {
       label=''
       case "${rel,,}" in
         /efi/microsoft/boot/bootmgfw.efi) label='Windows Boot Manager' ;;
-        /efi/*/shimx64.efi)              dir="$(basename "$(dirname "$rel")")"; label="${dir^} Linux Bootloader" ;;
+        /efi/*/shimx64.efi)             dir="$(basename "$(dirname "$rel")")"; label="${dir^} Linux Bootloader" ;;
         /efi/*/grubx64.efi)             dir="$(basename "$(dirname "$rel")")"; label="${dir^} GRUB Bootloader" ;;
         /efi/*/systemd-bootx64.efi)     dir="$(basename "$(dirname "$rel")")"; label="${dir^} systemd-boot" ;;
         *) continue ;;
@@ -129,6 +129,11 @@ EOT
   
   chmod 755 "$out"
 }
+
+# Prompt for the new user *before* starting disk operations
+echo
+read -r -p 'Enter username for the new account: ' NEW_USER
+[[ -n "$NEW_USER" ]] || error 'Username cannot be empty.'
 
 # System Checks
 [[ $EUID -eq 0 ]] || error 'This installer must be run as root.'
@@ -293,8 +298,8 @@ while read -r ESP; do
   mount -o ro "$ESP" "/mnt/run/other-esps/$IDX" 2>/dev/null || { rmdir "/mnt/run/other-esps/$IDX"; IDX=$((IDX - 1)); }
 done < <(lsblk -nrpo NAME,FSTYPE,TYPE | awk '$2=="vfat"&&$3=="part"{print $1}')
 
-# Chroot System Configuration
-arch-chroot /mnt /bin/bash <<EOT
+# Chroot System Configuration (passing configuration variables)
+NEW_USER="$NEW_USER" TIMEZONE="$TIMEZONE" LOCALE="$LOCALE" KEYMAP="$KEYMAP" HOSTNAME="$HOSTNAME" arch-chroot /mnt /bin/bash <<'EOT'
 set -Eeuo pipefail
 
 ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
@@ -313,7 +318,15 @@ cat > /etc/hosts <<HOSTS
 HOSTS
 
 mkinitcpio -P
-echo "root:${ROOT_PASSWORD}" | chpasswd
+echo "root:1234" | chpasswd
+
+# Create user, add to wheel group, and set password to 1234
+useradd -m -G wheel -s /bin/bash "$NEW_USER"
+echo "${NEW_USER}:1234" | chpasswd
+
+# Enable passwordless sudo for the wheel group
+sed -i 's/^# *%wheel ALL=(ALL:ALL) NOPASSWD: ALL/%wheel ALL=(ALL:ALL) NOPASSWD: ALL/' /etc/sudoers
+
 systemctl enable NetworkManager
 
 if grep -q '^GRUB_DISABLE_OS_PROBER=' /etc/default/grub; then
@@ -323,6 +336,9 @@ else
 fi
 
 grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB --recheck
+
+# Run os-prober and generate grub config right before exiting chroot
+os-prober || true
 grub-mkconfig -o /boot/grub/grub.cfg
 EOT
 
