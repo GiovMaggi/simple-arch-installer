@@ -488,13 +488,9 @@ else
         ALIGNMENT=1
     fi
 
-    ALIGNED_START=$(
-        ((BEST_START + ALIGNMENT - 1) / ALIGNMENT) * ALIGNMENT
-    )
+    ALIGNED_START=$(( (BEST_START + ALIGNMENT - 1) / ALIGNMENT * ALIGNMENT ))
 
-    ALIGNED_END=$(
-        ((BEST_END + 1) / ALIGNMENT) * ALIGNMENT - 1
-    )
+    ALIGNED_END=$(( (BEST_END + 1) / ALIGNMENT * ALIGNMENT - 1 ))
 
     if (( ALIGNED_END < ALIGNED_START )); then
         error "Free space is too small after alignment."
@@ -508,12 +504,12 @@ else
     # --------------------------------------------------------
 
     EFI_SECTORS=$((1024 * 1024 * 1024 / SECTOR_SIZE))
+
     SWAP_SECTORS=$((4 * 1024 * 1024 * 1024 / SECTOR_SIZE))
+
     ROOT_MIN_SECTORS=$((2 * 1024 * 1024 * 1024 / SECTOR_SIZE))
 
-    REQUIRED_SECTORS=$(
-        EFI_SECTORS + SWAP_SECTORS + ROOT_MIN_SECTORS
-    )
+    REQUIRED_SECTORS=$((EFI_SECTORS + SWAP_SECTORS + ROOT_MIN_SECTORS))
 
 
     if (( AVAILABLE_SECTORS < REQUIRED_SECTORS )); then
@@ -554,12 +550,15 @@ Required:
     # --------------------------------------------------------
 
     EFI_START="$ALIGNED_START"
+
     EFI_END=$((EFI_START + EFI_SECTORS - 1))
 
     SWAP_START=$((EFI_END + 1))
+
     SWAP_END=$((SWAP_START + SWAP_SECTORS - 1))
 
     ROOT_START=$((SWAP_END + 1))
+
     ROOT_END="$ALIGNED_END"
 
     ROOT_SECTORS=$((ROOT_END - ROOT_START + 1))
@@ -575,7 +574,9 @@ Required:
     # --------------------------------------------------------
 
     EFI_PART="$(part_path "$DISK" "$EFI_NUMBER")"
+
     SWAP_PART="$(part_path "$DISK" "$SWAP_NUMBER")"
+
     ROOT_PART="$(part_path "$DISK" "$ROOT_NUMBER")"
 
 
@@ -592,6 +593,7 @@ Required:
 
     echo "New partitions:"
     echo
+
     echo "  EFI"
     echo "    Device : $EFI_PART"
     echo "    Size   : 1 GiB"
