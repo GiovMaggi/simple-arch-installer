@@ -1,30 +1,33 @@
 #!/bin/bash
 
-set -euo pipefail
+set -Eeuo pipefail
 
 # ============================================================
-# Simple automatic Arch Linux installer
+# Simple Automatic Arch Linux Installer
 #
-# Prompts ONLY for:
-# 1. Disk
-# 2. Mode: erase / all
+# Modes:
+#   erase = completely wipe selected disk
+#   all   = install only into unallocated space
 #
-# Configuration:
-# Hostname: Arch
-# Locale: en_US.UTF-8
-# Keyboard: us
-# Timezone: Europe/Rome
-# Root password: 1234
+# Filesystem:
+#   ext4
 #
-# Packages:
-# base linux-zen linux-firmware efibootmgr networkmanager
-# grub base-devel os-prober linux-zen-headers sudo nano
+# Boot:
+#   UEFI + GRUB
+#
+# Kernel:
+#   linux-zen
+#
 # ============================================================
 
 HOSTNAME="Arch"
 TIMEZONE="Europe/Rome"
 LOCALE="en_US.UTF-8"
 KEYMAP="us"
+
+# WARNING:
+# This password is intentionally set here because that is how
+# the original script was configured.
 ROOT_PASSWORD="1234"
 
 PACKAGES=(
@@ -42,19 +45,50 @@ PACKAGES=(
 )
 
 # ------------------------------------------------------------
-# Basic checks
+# Colors / output helpers
+# ------------------------------------------------------------
+
+RED=""
+GREEN=""
+YELLOW=""
+RESET=""
+
+error() {
+    echo
+    echo "ERROR: $*"
+    echo
+    exit 1
+}
+
+info() {
+    echo "==> $*"
+}
+
+warn() {
+    echo "WARNING: $*"
+}
+
+# ------------------------------------------------------------
+# Root check
 # ------------------------------------------------------------
 
 if [[ $EUID -ne 0 ]]; then
-    echo "This installer must be run as root."
-    exit 1
+    error "This installer must be run as root."
 fi
 
+# ------------------------------------------------------------
+# UEFI check
+# ------------------------------------------------------------
+
 if [[ ! -d /sys/firmware/efi ]]; then
-    echo "ERROR: The Arch ISO was not booted in UEFI mode."
-    echo "Boot the USB in UEFI mode and run the installer again."
-    exit 1
+    error "The Arch ISO was not booted in UEFI mode.
+
+Boot the Arch USB in UEFI mode and run the installer again."
 fi
+
+# ------------------------------------------------------------
+# Required commands
+# ------------------------------------------------------------
 
 REQUIRED_COMMANDS=(
     lsblk
@@ -64,35 +98,73 @@ REQUIRED_COMMANDS=(
     mkfs.fat
     mkswap
     swapon
+    swapoff
     pacstrap
     genfstab
     arch-chroot
     blkid
     blockdev
-    curl
+    mount
+    umount
+    findmnt
+    awk
+    grep
+    sed
+    sync
+    reboot
+    ping
+    partprobe
+    udevadm
 )
+
+info "Checking required commands..."
 
 for cmd in "${REQUIRED_COMMANDS[@]}"; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
-        echo "ERROR: Required command not found: $cmd"
-        exit 1
+        error "Required command not found: $cmd"
     fi
 done
 
 # ------------------------------------------------------------
-# Internet check
+# Network check
 # ------------------------------------------------------------
 
-echo "Checking internet connection..."
+check_network() {
+    info "Checking internet connection..."
 
-if ! ping -c 1 -W 3 archlinux.org >/dev/null 2>&1; then
-    echo "ERROR: No internet connection."
-    echo "Connect to the internet and run the installer again."
-    exit 1
-fi
+    # First test raw connectivity.
+    if ping -c 1 -W 3 1.1.1.1 >/dev/null 2>&1; then
+
+        # Then test DNS.
+        if ping -c 1 -W 3 archlinux.org >/dev/null 2>&1; then
+            info "Internet connection OK."
+            return 0
+        fi
+
+        error "Internet connectivity works, but DNS is not working.
+
+Try:
+
+    ping -c 1 1.1.1.1
+    ping -c 1 archlinux.org
+
+If the first works and the second fails, fix DNS before
+running the installer again."
+    fi
+
+    error "No internet connection.
+
+Check your network connection in the Arch ISO.
+
+For Wi-Fi, use:
+
+    iwctl
+
+Then connect to your network and run the installer again."
+}
 
 # ------------------------------------------------------------
-# Helpers
+# Partition path helper
 # ------------------------------------------------------------
 
 part_path() {
@@ -109,19 +181,42 @@ part_path() {
     esac
 }
 
+# ------------------------------------------------------------
+# Wait for partition to appear
+# ------------------------------------------------------------
+
 wait_for_partition() {
     local part="$1"
 
-    for _ in {1..20}; do
+    info "Waiting for $part to appear..."
+
+    for _ in {1..30}; do
         if [[ -b "$part" ]]; then
             return 0
         fi
+
         sleep 0.5
+        udevadm settle 2>/dev/null || true
     done
 
-    echo "ERROR: Partition did not appear: $part"
-    exit 1
+    error "Partition did not appear: $part"
 }
+
+# ------------------------------------------------------------
+# Refresh partition table
+# ------------------------------------------------------------
+
+refresh_partition_table() {
+    local disk="$1"
+
+    partprobe "$disk" 2>/dev/null || true
+    udevadm settle
+    sleep 1
+}
+
+# ------------------------------------------------------------
+# Find available partition number
+# ------------------------------------------------------------
 
 next_free_partition_number() {
     local disk="$1"
@@ -136,82 +231,167 @@ next_free_partition_number() {
         fi
     done
 
-    echo "ERROR: No free GPT partition number available."
-    exit 1
+    error "No free GPT partition number available."
 }
 
 # ------------------------------------------------------------
-# Show disks
+# Check whether disk contains mounted partitions
 # ------------------------------------------------------------
 
-echo
-echo "Available disks:"
-echo
+check_disk_not_mounted() {
+    local disk="$1"
 
-mapfile -t DISKS < <(
-    lsblk -dpno NAME,SIZE,MODEL,TYPE |
-    awk '$4 == "disk" {print}'
-)
+    if lsblk -nrpo NAME,MOUNTPOINT "$disk" |
+        awk '$2 != "" {found=1} END {exit !found}'
+    then
+        error "The selected disk has mounted partitions.
 
-if [[ ${#DISKS[@]} -eq 0 ]]; then
-    echo "ERROR: No disks found."
-    exit 1
-fi
+Unmount them before running the installer."
+    fi
+}
 
-for i in "${!DISKS[@]}"; do
-    printf "%2d) %s\n" "$((i + 1))" "${DISKS[$i]}"
-done
+# ------------------------------------------------------------
+# Display disks
+# ------------------------------------------------------------
 
-echo
+show_disks() {
+    echo
+    echo "============================================================"
+    echo " Available disks"
+    echo "============================================================"
+    echo
+
+    mapfile -t DISKS < <(
+        lsblk -dpno NAME,SIZE,MODEL,TYPE |
+        awk '$4 == "disk" {print}'
+    )
+
+    if [[ ${#DISKS[@]} -eq 0 ]]; then
+        echo
+        echo "lsblk output:"
+        lsblk -o NAME,SIZE,TYPE,MODEL
+        echo
+        error "No physical disks were detected by the Arch ISO."
+    fi
+
+    for i in "${!DISKS[@]}"; do
+        printf "%2d) %s\n" "$((i + 1))" "${DISKS[$i]}"
+    done
+
+    echo
+}
+
+# ============================================================
+# DISK SELECTION
+# ============================================================
+
+show_disks
+
 read -r -p "Choose disk number: " DISK_NUMBER
 
 if ! [[ "$DISK_NUMBER" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: Invalid disk number."
-    exit 1
+    error "Invalid disk number."
 fi
 
 if (( DISK_NUMBER < 1 || DISK_NUMBER > ${#DISKS[@]} )); then
-    echo "ERROR: Invalid disk number."
-    exit 1
+    error "Invalid disk number."
 fi
 
 DISK_LINE="${DISKS[$((DISK_NUMBER - 1))]}"
 DISK="$(awk '{print $1}' <<< "$DISK_LINE")"
 
 echo
-echo "Selected disk: $DISK"
+echo "Selected disk:"
+echo "  $DISK_LINE"
 echo
 
 # ------------------------------------------------------------
-# Choose mode
+# Prevent selecting the running ISO
 # ------------------------------------------------------------
 
-read -r -p "Choose mode (erase/all): " MODE
+ROOT_SOURCE="$(findmnt -no SOURCE / 2>/dev/null || true)"
+
+if [[ -n "$ROOT_SOURCE" ]]; then
+    case "$ROOT_SOURCE" in
+        "$DISK"|"$DISK"*)
+            error "The selected disk appears to contain the currently running Arch ISO.
+
+Choose the actual installation disk."
+            ;;
+    esac
+fi
+
+# ------------------------------------------------------------
+# Check disk is not mounted
+# ------------------------------------------------------------
+
+check_disk_not_mounted "$DISK"
+
+# ============================================================
+# MODE SELECTION
+# ============================================================
+
+echo "Choose installation mode:"
+echo
+echo "  erase = completely erase the selected disk"
+echo "  all   = install only into unallocated space"
+echo
+
+read -r -p "Mode (erase/all): " MODE
 
 case "$MODE" in
     erase|all)
         ;;
     *)
-        echo "ERROR: Mode must be exactly 'erase' or 'all'."
-        exit 1
+        error "Mode must be exactly 'erase' or 'all'."
         ;;
 esac
 
-# ------------------------------------------------------------
-# Make sure selected disk is not the Arch ISO itself
-# ------------------------------------------------------------
+# ============================================================
+# FINAL SAFETY CONFIRMATION
+# ============================================================
 
-ROOT_SOURCE="$(findmnt -no SOURCE /)"
+echo
+echo "============================================================"
+echo " WARNING"
+echo "============================================================"
+echo
+echo "Disk : $DISK"
+echo "Mode : $MODE"
+echo
 
-if [[ "$ROOT_SOURCE" == "$DISK"* ]]; then
-    echo "ERROR: The selected disk appears to contain the running Arch ISO."
-    echo "Choose the actual installation disk."
-    exit 1
+if [[ "$MODE" == "erase" ]]; then
+    echo "ERASE mode will DESTROY ALL DATA on:"
+    echo
+    echo "    $DISK"
+    echo
+else
+    echo "ALL mode will only create partitions inside unallocated"
+    echo "space on:"
+    echo
+    echo "    $DISK"
+    echo
+    echo "Existing partitions will NOT be formatted."
 fi
 
-# ------------------------------------------------------------
-# Variables for new partitions
-# ------------------------------------------------------------
+echo
+read -r -p "Type YES to continue: " CONFIRM
+
+if [[ "$CONFIRM" != "YES" ]]; then
+    echo
+    echo "Installation cancelled."
+    exit 0
+fi
+
+# ============================================================
+# NOW CHECK NETWORK
+# ============================================================
+
+check_network
+
+# ============================================================
+# VARIABLES
+# ============================================================
 
 EFI_PART=""
 SWAP_PART=""
@@ -224,20 +404,22 @@ ROOT_PART=""
 if [[ "$MODE" == "erase" ]]; then
 
     echo
-    echo "ERASE MODE"
-    echo "Creating a completely new GPT partition table on $DISK..."
+    echo "============================================================"
+    echo " ERASE MODE"
+    echo "============================================================"
     echo
 
-    # This destroys the existing partition table.
+    info "Wiping existing partition table..."
+
     sfdisk --wipe always "$DISK" <<'EOF'
 label: gpt
+
 size=1G, type=U, name="EFI"
 size=4G, type=S, name="swap"
-size=+, type=L, name="root"
+size=, type=L, name="root"
 EOF
 
-    partprobe "$DISK" 2>/dev/null || true
-    udevadm settle
+    refresh_partition_table "$DISK"
 
     EFI_PART="$(part_path "$DISK" 1)"
     SWAP_PART="$(part_path "$DISK" 2)"
@@ -254,26 +436,29 @@ EOF
 else
 
     echo
-    echo "ALL MODE"
-    echo "Searching ONLY for unallocated/free space..."
+    echo "============================================================"
+    echo " ALL MODE"
+    echo "============================================================"
     echo
+
+    info "Looking for unallocated space..."
 
     SECTOR_SIZE="$(blockdev --getss "$DISK")"
 
     if [[ -z "$SECTOR_SIZE" || "$SECTOR_SIZE" -le 0 ]]; then
-        echo "ERROR: Could not determine disk sector size."
-        exit 1
+        error "Could not determine disk sector size."
     fi
 
-    # Find the largest contiguous unallocated region.
-    #
-    # sfdisk --list-free reports free, unpartitioned areas.
-    # Existing partitions are never selected.
+    # --------------------------------------------------------
+    # Find largest free region
+    # --------------------------------------------------------
+
     BEST_START=""
     BEST_END=""
     BEST_SECTORS=0
 
     while read -r START END; do
+
         [[ "$START" =~ ^[0-9]+$ ]] || continue
         [[ "$END" =~ ^[0-9]+$ ]] || continue
 
@@ -284,54 +469,80 @@ else
             BEST_END="$END"
             BEST_SECTORS="$SECTORS"
         fi
+
     done < <(
         sfdisk --list-free --no-reread "$DISK" 2>/dev/null |
-        awk 'NR > 1 && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {print $1, $2}'
+        awk '
+            $1 ~ /^[0-9]+$/ &&
+            $2 ~ /^[0-9]+$/ {
+                print $1, $2
+            }
+        '
     )
 
     if [[ -z "$BEST_START" || -z "$BEST_END" ]]; then
-        echo "ERROR: No unallocated space exists on $DISK."
-        echo "ALL mode will not modify existing partitions."
-        exit 1
+        error "No unallocated space was found on $DISK.
+
+ALL mode will not modify existing partitions."
     fi
 
-    # Align free-space boundaries to 1 MiB.
+    # --------------------------------------------------------
+    # Align to 1 MiB
+    # --------------------------------------------------------
+
     ALIGN=$((1024 * 1024 / SECTOR_SIZE))
 
-    if (( ALIGN < 1 )); then
-        ALIGN=1
-    fi
+    (( ALIGN < 1 )) && ALIGN=1
 
-    ALIGNED_START=$(( ((BEST_START + ALIGN - 1) / ALIGN) * ALIGN ))
-    ALIGNED_END=$(( ((BEST_END + 1) / ALIGN) * ALIGN - 1 ))
+    ALIGNED_START=$(
+        ((BEST_START + ALIGN - 1) / ALIGN) * ALIGN
+    )
+
+    ALIGNED_END=$(
+        ((BEST_END + 1) / ALIGN) * ALIGN - 1
+    )
 
     if (( ALIGNED_END < ALIGNED_START )); then
-        echo "ERROR: Free space is too small after alignment."
-        exit 1
+        error "Free space is too small after alignment."
     fi
 
     AVAILABLE_SECTORS=$((ALIGNED_END - ALIGNED_START + 1))
 
+    # --------------------------------------------------------
+    # Partition sizes
+    # --------------------------------------------------------
+
     EFI_SECTORS=$((1024 * 1024 * 1024 / SECTOR_SIZE))
     SWAP_SECTORS=$((4 * 1024 * 1024 * 1024 / SECTOR_SIZE))
 
-    # Require at least 2 GiB left for root.
-    ROOT_MIN_SECTORS=$((2 * 1024 * 1024 * 1024 / SECTOR_SIZE))
+    ROOT_MIN_SECTORS=$(
+        2 * 1024 * 1024 * 1024 / SECTOR_SIZE
+    )
 
-    REQUIRED_SECTORS=$((EFI_SECTORS + SWAP_SECTORS + ROOT_MIN_SECTORS))
+    REQUIRED_SECTORS=$(
+        EFI_SECTORS +
+        SWAP_SECTORS +
+        ROOT_MIN_SECTORS
+    )
 
     if (( AVAILABLE_SECTORS < REQUIRED_SECTORS )); then
-        echo "ERROR: The largest contiguous free area is too small."
-        echo "ALL mode requires enough free space for:"
-        echo " 1 GiB EFI"
-        echo " 4 GiB swap"
-        echo " at least 2 GiB root"
-        echo
-        echo "No partitions were modified."
-        exit 1
+        error "The largest unallocated area is too small.
+
+ALL mode requires at least:
+  1 GiB EFI
+  4 GiB swap
+  2 GiB root"
     fi
 
+    # --------------------------------------------------------
+    # Partition numbers
+    # --------------------------------------------------------
+
     NEXT_PART="$(next_free_partition_number "$DISK")"
+
+    EFI_NUMBER="$NEXT_PART"
+    SWAP_NUMBER="$((NEXT_PART + 1))"
+    ROOT_NUMBER="$((NEXT_PART + 2))"
 
     EFI_START="$ALIGNED_START"
     EFI_END=$((EFI_START + EFI_SECTORS - 1))
@@ -342,163 +553,259 @@ else
     ROOT_START=$((SWAP_END + 1))
     ROOT_END="$ALIGNED_END"
 
-    EFI_PART="$(part_path "$DISK" "$NEXT_PART")"
-    SWAP_PART="$(part_path "$DISK" "$((NEXT_PART + 1))")"
-    ROOT_PART="$(part_path "$DISK" "$((NEXT_PART + 2))")"
+    EFI_PART="$(part_path "$DISK" "$EFI_NUMBER")"
+    SWAP_PART="$(part_path "$DISK" "$SWAP_NUMBER")"
+    ROOT_PART="$(part_path "$DISK" "$ROOT_NUMBER")"
 
-    echo "Free region selected:"
-    echo " Start sector: $ALIGNED_START"
-    echo " End sector: $ALIGNED_END"
+    # --------------------------------------------------------
+    # Show exactly what will be created
+    # --------------------------------------------------------
+
     echo
-    echo "Creating new partitions ONLY inside that free region..."
+    echo "Free space selected:"
+    echo
+    echo "  EFI : $EFI_PART"
+    echo "        1 GiB"
+    echo
+    echo "  SWAP: $SWAP_PART"
+    echo "        4 GiB"
+    echo
+    echo "  ROOT: $ROOT_PART"
+    echo "        remaining free space"
+    echo
+
+    info "Creating partitions inside free space..."
 
     sfdisk --append --no-reread "$DISK" <<EOF
-${NEXT_PART}: start=${EFI_START}, size=${EFI_SECTORS}, type=U, name="EFI"
-$((NEXT_PART + 1)): start=${SWAP_START}, size=${SWAP_SECTORS}, type=S, name="swap"
-$((NEXT_PART + 2)): start=${ROOT_START}, size=$((ROOT_END - ROOT_START + 1)), type=L, name="root"
+${EFI_NUMBER}: start=${EFI_START}, size=${EFI_SECTORS}, type=U, name="EFI"
+${SWAP_NUMBER}: start=${SWAP_START}, size=${SWAP_SECTORS}, type=S, name="swap"
+${ROOT_NUMBER}: start=${ROOT_START}, size=$((ROOT_END - ROOT_START + 1)), type=L, name="root"
 EOF
 
-    partprobe "$DISK" 2>/dev/null || true
-    udevadm settle
+    refresh_partition_table "$DISK"
 
     wait_for_partition "$EFI_PART"
     wait_for_partition "$SWAP_PART"
     wait_for_partition "$ROOT_PART"
+
 fi
 
-# ------------------------------------------------------------
-# Verify that the new partitions exist
-# ------------------------------------------------------------
-
-if [[ ! -b "$EFI_PART" || ! -b "$SWAP_PART" || ! -b "$ROOT_PART" ]]; then
-    echo "ERROR: New partitions were not detected."
-    exit 1
-fi
+# ============================================================
+# VERIFY PARTITIONS
+# ============================================================
 
 echo
-echo "New partitions:"
+echo "============================================================"
+echo " New partitions"
+echo "============================================================"
+echo
+
 echo "EFI : $EFI_PART"
 echo "SWAP: $SWAP_PART"
 echo "ROOT: $ROOT_PART"
 echo
 
-# ------------------------------------------------------------
-# Format ONLY the new partitions
-# ------------------------------------------------------------
+for part in "$EFI_PART" "$SWAP_PART" "$ROOT_PART"; do
+    if [[ ! -b "$part" ]]; then
+        error "Expected partition does not exist: $part"
+    fi
+done
 
-echo "Formatting root..."
+# ============================================================
+# FORMAT
+# ============================================================
+
+echo
+echo "============================================================"
+echo " Formatting"
+echo "============================================================"
+echo
+
+info "Formatting root as ext4..."
+
 mkfs.ext4 -F "$ROOT_PART"
 
-echo "Formatting swap..."
+info "Formatting swap..."
+
 mkswap "$SWAP_PART"
 
-echo "Formatting EFI..."
+info "Formatting EFI partition as FAT32..."
+
 mkfs.fat -F 32 "$EFI_PART"
 
-# ------------------------------------------------------------
-# Mount
-# ------------------------------------------------------------
+# ============================================================
+# MOUNT
+# ============================================================
 
-echo "Mounting root..."
+echo
+echo "============================================================"
+echo " Mounting"
+echo "============================================================"
+echo
+
+info "Mounting root..."
+
 mount "$ROOT_PART" /mnt
 
-echo "Mounting EFI..."
+info "Mounting EFI..."
+
 mkdir -p /mnt/boot
 mount "$EFI_PART" /mnt/boot
 
-echo "Enabling swap..."
+info "Enabling swap..."
+
 swapon "$SWAP_PART"
 
-# ------------------------------------------------------------
-# Install Arch
-# ------------------------------------------------------------
+# ============================================================
+# INSTALL ARCH
+# ============================================================
 
 echo
-echo "Installing Arch Linux..."
+echo "============================================================"
+echo " Installing Arch Linux"
+echo "============================================================"
 echo
+
+info "Installing packages..."
 
 pacstrap -K /mnt "${PACKAGES[@]}"
 
-# ------------------------------------------------------------
-# Generate fstab
-# ------------------------------------------------------------
+# ============================================================
+# FSTAB
+# ============================================================
 
-genfstab -U /mnt >> /mnt/etc/fstab
+info "Generating fstab..."
 
-# ------------------------------------------------------------
-# Configure installed system
-# ------------------------------------------------------------
+genfstab -U /mnt > /mnt/etc/fstab
+
+# ============================================================
+# CONFIGURE SYSTEM
+# ============================================================
 
 echo
-echo "Configuring installed system..."
+echo "============================================================"
+echo " Configuring installed system"
+echo "============================================================"
 echo
 
 arch-chroot /mnt /bin/bash <<EOF
-set -e
+set -Eeuo pipefail
 
+# ------------------------------------------------------------
 # Timezone
+# ------------------------------------------------------------
+
 ln -sf /usr/share/zoneinfo/${TIMEZONE} /etc/localtime
 hwclock --systohc
 
+# ------------------------------------------------------------
 # Locale
+# ------------------------------------------------------------
+
 sed -i 's/^#${LOCALE} UTF-8/${LOCALE} UTF-8/' /etc/locale.gen
+
 locale-gen
+
 echo 'LANG=${LOCALE}' > /etc/locale.conf
 
+# ------------------------------------------------------------
 # Keyboard
+# ------------------------------------------------------------
+
 echo 'KEYMAP=${KEYMAP}' > /etc/vconsole.conf
 
+# ------------------------------------------------------------
 # Hostname
+# ------------------------------------------------------------
+
 echo '${HOSTNAME}' > /etc/hostname
 
-# Hosts file
 cat > /etc/hosts <<HOSTS
-127.0.0.1 localhost
-::1 localhost
-127.0.1.1 ${HOSTNAME}.localdomain ${HOSTNAME}
+127.0.0.1   localhost
+::1         localhost
+127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
 HOSTS
 
+# ------------------------------------------------------------
 # Initramfs
+# ------------------------------------------------------------
+
 mkinitcpio -P
 
+# ------------------------------------------------------------
 # Root password
+# ------------------------------------------------------------
+
 echo 'root:${ROOT_PASSWORD}' | chpasswd
 
+# ------------------------------------------------------------
 # NetworkManager
+# ------------------------------------------------------------
+
 systemctl enable NetworkManager
 
-# os-prober
+# ------------------------------------------------------------
+# GRUB os-prober
+# ------------------------------------------------------------
+
 if grep -q '^#GRUB_DISABLE_OS_PROBER=false' /etc/default/grub; then
-    sed -i 's/^#GRUB_DISABLE_OS_PROBER=false/GRUB_DISABLE_OS_PROBER=false/' /etc/default/grub
+    sed -i \
+        's/^#GRUB_DISABLE_OS_PROBER=false/GRUB_DISABLE_OS_PROBER=false/' \
+        /etc/default/grub
 elif ! grep -q '^GRUB_DISABLE_OS_PROBER=' /etc/default/grub; then
     echo 'GRUB_DISABLE_OS_PROBER=false' >> /etc/default/grub
 fi
 
-# GRUB UEFI
+# ------------------------------------------------------------
+# GRUB UEFI installation
+# ------------------------------------------------------------
+
 grub-install \
     --target=x86_64-efi \
     --efi-directory=/boot \
     --bootloader-id=GRUB
 
+# ------------------------------------------------------------
+# GRUB configuration
+# ------------------------------------------------------------
+
 grub-mkconfig -o /boot/grub/grub.cfg
+
 EOF
 
-# ------------------------------------------------------------
-# Finish
-# ------------------------------------------------------------
+# ============================================================
+# FINISH
+# ============================================================
+
+echo
+echo "============================================================"
+echo " Finishing installation"
+echo "============================================================"
+echo
+
+info "Syncing disks..."
 
 sync
 
+info "Disabling swap..."
+
 swapoff "$SWAP_PART" 2>/dev/null || true
+
+info "Unmounting..."
 
 umount -R /mnt
 
 echo
-echo "============================================"
-echo " Arch Linux installation completed."
-echo "============================================"
+echo "============================================================"
+echo "        ARCH LINUX INSTALLATION COMPLETE"
+echo "============================================================"
 echo
-echo "Remove the Arch USB when the computer reboots."
+echo "Disk : $DISK"
+echo "Mode : $MODE"
 echo
+echo "Remove the Arch USB when the computer restarts."
+echo
+
+read -r -p "Press ENTER to reboot..."
 
 reboot
