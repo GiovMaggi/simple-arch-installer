@@ -1,29 +1,6 @@
 #!/bin/bash
 set -Eeuo pipefail
 
-# Configuration
-HOSTNAME="Arch"
-TIMEZONE="Europe/Rome"
-LOCALE="en_US.UTF-8"
-KEYMAP="us"
-ROOT_PASSWORD="1234"
-
-PACKAGES=(
-  base
-  linux-zen
-  linux-firmware
-  efibootmgr
-  networkmanager
-  grub
-  base-devel
-  os-prober
-  linux-zen-headers
-  sudo
-  nano
-  fuse3
-  ntfs-3g
-)
-
 # Helper Functions
 error() {
   echo
@@ -130,10 +107,91 @@ EOT
   chmod 755 "$out"
 }
 
-# Prompt for the new user *before* starting disk operations
+# Interactive Prompts
+echo
+read -r -p 'Enter hostname for the system: ' HOSTNAME
+[[ -n "$HOSTNAME" ]] || error 'Hostname cannot be empty.'
+
 echo
 read -r -p 'Enter username for the new account: ' NEW_USER
 [[ -n "$NEW_USER" ]] || error 'Username cannot be empty.'
+
+read -r -s -p 'Enter global password for root and user: ' GLOBAL_PASSWORD
+echo
+[[ -n "$GLOBAL_PASSWORD" ]] || error 'Password cannot be empty.'
+
+echo
+echo 'Select language and keyboard layout:'
+echo '1) en (US English)'
+echo '2) it (Italian)'
+read -r -p 'Choose option (1 or 2): ' LANG_CHOICE
+
+case "$LANG_CHOICE" in
+  1|en)
+    LOCALE="en_US.UTF-8"
+    KEYMAP="us"
+    TIMEZONE="America/New_York"
+    ;;
+  2|it)
+    LOCALE="it_IT.UTF-8"
+    KEYMAP="it"
+    TIMEZONE="Europe/Rome"
+    ;;
+  *)
+    error 'Invalid language choice.'
+    ;;
+esac
+
+echo
+echo 'Select Desktop Environment:'
+echo '1) kde (Plasma + SDDM)'
+echo '2) gnome (GNOME + GDM)'
+echo '3) xfce (XFCE4 + LightDM)'
+echo '4) none (No Desktop Environment)'
+read -r -p 'Choose option (1-4): ' DE_CHOICE
+
+DE_PACKAGES=()
+DM_SERVICE=""
+
+case "$DE_CHOICE" in
+  1|kde)
+    DE_PACKAGES=(plasma kde-applications sddm)
+    DM_SERVICE="sddm"
+    ;;
+  2|gnome)
+    DE_PACKAGES=(gnome gdm)
+    DM_SERVICE="gdm"
+    ;;
+  3|xfce)
+    DE_PACKAGES=(xfce4 xfce4-goodies lightdm lightdm-gtk-greeter)
+    DM_SERVICE="lightdm"
+    ;;
+  4|none)
+    DE_PACKAGES=()
+    DM_SERVICE=""
+    ;;
+  *)
+    error 'Invalid DE choice.'
+    ;;
+esac
+
+PACKAGES=(
+  base
+  linux-zen
+  linux-firmware
+  efibootmgr
+  networkmanager
+  grub
+  base-devel
+  os-prober
+  linux-zen-headers
+  sudo
+  nano
+  fuse3
+  ntfs-3g
+  alacritty
+  "${DE_PACKAGES[@]}"
+)
 
 # System Checks
 [[ $EUID -eq 0 ]] || error 'This installer must be run as root.'
@@ -295,11 +353,13 @@ while read -r ESP; do
   [[ -b "$ESP" && "$ESP" != "$EFI_PART" ]] || continue
   IDX=$((IDX + 1))
   mkdir -p "/mnt/run/other-esps/$IDX"
+  mkdir -p "/mnt/media/esp-$IDX"
   mount -o ro "$ESP" "/mnt/run/other-esps/$IDX" 2>/dev/null || { rmdir "/mnt/run/other-esps/$IDX"; IDX=$((IDX - 1)); }
+  mount --bind "/mnt/run/other-esps/$IDX" "/mnt/media/esp-$IDX" 2>/dev/null || true
 done < <(lsblk -nrpo NAME,FSTYPE,TYPE | awk '$2=="vfat"&&$3=="part"{print $1}')
 
-# Chroot System Configuration (passing configuration variables)
-NEW_USER="$NEW_USER" TIMEZONE="$TIMEZONE" LOCALE="$LOCALE" KEYMAP="$KEYMAP" HOSTNAME="$HOSTNAME" arch-chroot /mnt /bin/bash <<'EOT'
+# Chroot System Configuration
+arch-chroot /mnt /bin/bash <<EOT
 set -Eeuo pipefail
 
 ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
@@ -318,16 +378,18 @@ cat > /etc/hosts <<HOSTS
 HOSTS
 
 mkinitcpio -P
-echo "root:1234" | chpasswd
+echo "root:${GLOBAL_PASSWORD}" | chpasswd
 
-# Create user, add to wheel group, and set password to 1234
-useradd -m -G wheel -s /bin/bash "$NEW_USER"
-echo "${NEW_USER}:1234" | chpasswd
+useradd -m -G wheel -s /bin/bash "${NEW_USER}"
+echo "${NEW_USER}:${GLOBAL_PASSWORD}" | chpasswd
 
-# Enable passwordless sudo for the wheel group
 sed -i 's/^# *%wheel ALL=(ALL:ALL) NOPASSWD: ALL/%wheel ALL=(ALL:ALL) NOPASSWD: ALL/' /etc/sudoers
 
 systemctl enable NetworkManager
+
+if [ -n "${DM_SERVICE}" ]; then
+  systemctl enable "${DM_SERVICE}"
+fi
 
 if grep -q '^GRUB_DISABLE_OS_PROBER=' /etc/default/grub; then
   sed -i 's/^GRUB_DISABLE_OS_PROBER=.*/GRUB_DISABLE_OS_PROBER=false/' /etc/default/grub
@@ -337,12 +399,13 @@ fi
 
 grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB --recheck
 
-# Run os-prober and generate grub config right before exiting chroot
 os-prober || true
 grub-mkconfig -o /boot/grub/grub.cfg
 EOT
 
 # Clean Unmounting & Finalization
+umount -Rl /mnt/media 2>/dev/null || true
+rm -rf /mnt/media 2>/dev/null || true
 umount -Rl /mnt/run/other-esps 2>/dev/null || true
 rm -rf /mnt/run/other-esps 2>/dev/null || true
 
